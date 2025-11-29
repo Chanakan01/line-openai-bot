@@ -30,20 +30,36 @@ const STABILITY_API_KEY = process.env.STABILITY_API_KEY;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 
 // ------------- MEMORY (จำบทสนทนา 20 นาที) -------------
-let memory = {}; // { userId: [ {role, content}, ... ] }
+// โครงสร้าง: { userId: [ { role: "user" | "assistant", content: string }, ... ] }
+let memory = {};
 
-function saveMessage(userId, role, content) {
+/**
+ * บันทึกข้อความใน memory
+ * role ต้องเป็น "user" | "assistant" | "system" เพื่อให้ใช้กับ OpenAI ได้ตรง ๆ
+ */
+function saveMessage(userId, role, content) { // ⭐ UPDATED
   if (!userId || !content) return;
-  if (!memory[userId]) memory[userId] = [];
-  memory[userId].push({ role, content });
+  if (!["user", "assistant", "system"].includes(role)) return;
 
-  // จำกัดความยาวประวัติ
+  if (!memory[userId]) memory[userId] = [];
+  memory[userId].push({ role, content: String(content) });
+
+  // จำกัดความยาวประวัติ (20 ข้อ)
   if (memory[userId].length > 20) memory[userId].shift();
 
-  // เคลียร์ทิ้งหลัง 20 นาที
+  // เคลียร์ทิ้งหลัง 20 นาที (นับจากข้อความล่าสุด)
   setTimeout(() => {
     delete memory[userId];
   }, 20 * 60 * 1000);
+}
+
+// helper: ดึงบทสนทนาทั้งหมดของ user ไปใช้กับ OpenAI
+function getConversationMessages(userId) { // ⭐ NEW
+  const history = memory[userId] || [];
+  return history.map((m) => ({
+    role: m.role,
+    content: m.content,
+  }));
 }
 
 // ------------- ตัวช่วยตรวจว่าควรค้นเว็บไหม -------------
@@ -190,6 +206,39 @@ async function generateImage(promptRaw) {
   }
 }
 
+// ------------- Quick Reply ปุ่มลัด -------------
+// ปุ่ม: 🧠 ถามการบ้าน / 🎨 ขอให้วาดรูป / 📰 สรุปข่าววันนี้
+function buildDefaultQuickReply() { // ⭐ NEW
+  return {
+    items: [
+      {
+        type: "action",
+        action: {
+          type: "message",
+          label: "🧠 ถามการบ้าน",
+          text: "ช่วยติวการบ้านให้หน่อย"
+        }
+      },
+      {
+        type: "action",
+        action: {
+          type: "message",
+          label: "🎨 ขอให้วาดรูป",
+          text: "ช่วยวาดรูปให้หน่อย"
+        }
+      },
+      {
+        type: "action",
+        action: {
+          type: "message",
+          label: "📰 สรุปข่าววันนี้",
+          text: "ช่วยสรุปข่าววันนี้ให้หน่อย"
+        }
+      }
+    ]
+  };
+}
+
 // ------------- สมองหลักของ Arvin (ChatGPT Brain + ไร้ขีดจำกัดตามกฎหมาย) -------------
 async function arvinChat(userId) {
   const messages = [
@@ -223,7 +272,7 @@ async function arvinChat(userId) {
 - พร้อมแซว พร้อมดุเบา ๆ ได้ แต่ไม่ข้ามเส้นกฎหมายและความปลอดภัย
       `.trim()
     },
-    ...(memory[userId] || [])
+    ...getConversationMessages(userId) // ⭐ UPDATED ใช้ history โดยตรง
   ];
 
   const res = await axios.post(
@@ -372,14 +421,19 @@ app.post("/webhook", async (req, res) => {
           saveMessage(userId, "assistant", analysis);
 
           await replyLINE(event.replyToken, [
-            { type: "text", text: analysis }
+            {
+              type: "text",
+              text: analysis,
+              quickReply: buildDefaultQuickReply() // ⭐ NEW: ใส่ปุ่มลัดให้ด้วย
+            }
           ]);
         } catch (err) {
           console.error("Handle image error:", err.response?.data || err.message);
           await replyLINE(event.replyToken, [
             {
               type: "text",
-              text: "ผมอ่านรูปนี้ไม่สำเร็จครับ ลองส่งใหม่อีกครั้งได้ไหมครับ 🙏"
+              text: "ผมอ่านรูปนี้ไม่สำเร็จครับ ลองส่งใหม่อีกครั้งได้ไหมครับ 🙏",
+              quickReply: buildDefaultQuickReply() // ⭐ NEW
             }
           ]);
         }
@@ -390,6 +444,19 @@ app.post("/webhook", async (req, res) => {
       if (event.message.type !== "text") continue;
       const userMessage = (event.message.text || "").trim();
       if (!userMessage) continue;
+
+      // ⭐ NEW: คำสั่ง /reset ล้าง memory ของ user นั้น
+      if (userMessage === "/reset") {
+        memory[userId] = [];
+        await replyLINE(event.replyToken, [
+          {
+            type: "text",
+            text: "ผมล้างประวัติการคุยของเราทั้งหมดให้แล้วนะครับ เริ่มคุยใหม่ได้เลย ✨",
+            quickReply: buildDefaultQuickReply()
+          }
+        ]);
+        continue;
+      }
 
       saveMessage(userId, "user", userMessage);
 
@@ -420,6 +487,7 @@ app.post("/webhook", async (req, res) => {
               type: "image",
               originalContentUrl: imageUrl,
               previewImageUrl: imageUrl
+              // ปกติ image message ใส่ quickReply ก็ได้ แต่หลายคนไม่ใส่
             }
           ]);
         } catch (err) {
@@ -427,7 +495,8 @@ app.post("/webhook", async (req, res) => {
             {
               type: "text",
               text:
-                "ผมสร้างรูปไม่สำเร็จครับ อาจมีปัญหาที่ระบบ Stability AI หรือตั้งค่า API key/URL ยังไม่ถูก ลองเช็กแล้วลองใหม่อีกครั้งนะครับ 😢"
+                "ผมสร้างรูปไม่สำเร็จครับ อาจมีปัญหาที่ระบบ Stability AI หรือตั้งค่า API key/URL ยังไม่ถูก ลองเช็กแล้วลองใหม่อีกครั้งนะครับ 😢",
+              quickReply: buildDefaultQuickReply() // ⭐ NEW
             }
           ]);
         }
@@ -438,7 +507,13 @@ app.post("/webhook", async (req, res) => {
       if (needWebSearch(userMessage)) {
         const answer = await answerWithWebSearch(userId, userMessage);
         saveMessage(userId, "assistant", answer);
-        await replyLINE(event.replyToken, [{ type: "text", text: answer }]);
+        await replyLINE(event.replyToken, [
+          {
+            type: "text",
+            text: answer,
+            quickReply: buildDefaultQuickReply() // ⭐ NEW
+          }
+        ]);
         continue;
       }
 
@@ -447,7 +522,11 @@ app.post("/webhook", async (req, res) => {
       saveMessage(userId, "assistant", answer);
 
       await replyLINE(event.replyToken, [
-        { type: "text", text: answer }
+        {
+          type: "text",
+          text: answer,
+          quickReply: buildDefaultQuickReply() // ⭐ NEW
+        }
       ]);
     } catch (err) {
       console.error("Event error:", err.response?.data || err.message);
