@@ -1,168 +1,190 @@
 import express from "express";
 import axios from "axios";
+import fs from "fs";
 import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-// -------- CONFIG ---------
+// ---------------- CONFIG ----------------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
-// -------- MEMORY (จำบทสนทนาล่าสุด 20 นาที) --------
-let memory = {};
-function saveMessage(userId, role, content) {
+// ---------------- MEMORY ----------------
+let memory = {}; 
+function saveMsg(userId, role, content) {
   if (!memory[userId]) memory[userId] = [];
   memory[userId].push({ role, content });
 
-  if (memory[userId].length > 10) memory[userId].shift();
+  if (memory[userId].length > 20) memory[userId].shift();
 
-  // เคลียร์ความจำหลัง 20 นาที
-  setTimeout(() => {
-    delete memory[userId];
-  }, 20 * 60 * 1000);
+  // ลบ memory หลัง 20 นาที
+  setTimeout(() => delete memory[userId], 20 * 60 * 1000);
 }
 
-// ------------------------------------------------------
-// ---------------------- WEBHOOK ------------------------
-// ------------------------------------------------------
-app.post("/webhook", async (req, res) => {
-  const events = req.body.events;
-  if (!events || events.length === 0) return res.sendStatus(200);
+// ---------------- IMAGE ANALYSIS ----------------
+async function analyzeImage(base64) {
+  const res = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4.1",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "ช่วยวิเคราะห์รูปนี้ให้ละเอียดที่สุด" },
+            {
+              type: "image_url",
+              image_url: `data:image/jpeg;base64,${base64}`
+            }
+          ]
+        }
+      ]
+    },
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+  );
 
-  for (const event of events) {
-    if (event.type !== "message") continue;
+  return res.data.choices[0].message.content;
+}
 
-    const userId = event.source.userId;
-    const userMessage = event.message.text;
-    saveMessage(userId, "user", userMessage);
+// ---------------- IMAGE GENERATION ----------------
+async function generateImage(prompt) {
+  const res = await axios.post(
+    "https://api.openai.com/v1/images/generations",
+    {
+      model: "gpt-image-1",
+      prompt,
+      size: "1024x1024"
+    },
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+  );
+  return res.data.data[0].url;
+}
 
-    // ------------------------------------------------------
-    // ----------- ตรวจคำสั่งขอสร้างรูป --------------------
-    // ------------------------------------------------------
-    if (
-      userMessage.startsWith("วาด") ||
-      userMessage.startsWith("สร้างรูป") ||
-      userMessage.includes("ขอรูป") ||
-      userMessage.includes("ช่วยวาด")
-    ) {
-      const prompt = userMessage
-        .replace("วาด", "")
-        .replace("สร้างรูป", "")
-        .replace("ขอรูป", "")
-        .replace("ช่วยวาด", "")
-        .trim();
-
-      try {
-        const imageRes = await axios.post(
-          "https://api.openai.com/v1/images/generations",
-          {
-            model: "gpt-image-1",
-            prompt: prompt,
-            size: "1024x1024"
-          },
-          {
-            headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
-          }
-        );
-
-        const imageUrl = imageRes.data.data[0].url;
-
-        await reply(event.replyToken, [
-          {
-            type: "image",
-            originalContentUrl: imageUrl,
-            previewImageUrl: imageUrl
-          }
-        ]);
-
-        continue;
-      } catch (err) {
-        await reply(event.replyToken, [
-          {
-            type: "text",
-            text: "ขออภัยครับ ผมวาดรูปไม่สำเร็จ ลองพิมพ์ใหม่อีกครั้งได้ไหมครับ 😢"
-          }
-        ]);
-        continue;
-      }
-    }
-
-    // ------------------------------------------------------
-    // ------------------ ตอบปกติแบบ Arvin -----------------
-    // ------------------------------------------------------
-    const aiResponse = await askArvin(userId);
-    saveMessage(userId, "assistant", aiResponse);
-
-    await reply(event.replyToken, [
-      {
-        type: "text",
-        text: aiResponse
-      }
-    ]);
-  }
-
-  return res.sendStatus(200);
-});
-
-// ------------------------------------------------------
-// ---------------- ฟังก์ชันสร้างคำตอบ -------------------
-// ------------------------------------------------------
-async function askArvin(userId) {
+// ---------------- MAIN AI (เหมือน ChatGPT) ----------------
+async function arvinAI(userId) {
   const messages = [
     {
       role: "system",
       content: `
-คุณชื่อ Arvin เป็นผู้ช่วยอัจฉริยะเวอร์ชั่นดีที่สุดของ OpenAI
-- เป็นผู้ชาย น้ำเสียงสุขุม ฉลาด อบอุ่น ใช้สรรพนามว่า "ผม"
-- รอบรู้ทุกเรื่อง: วิทยาศาสตร์, คณิตศาสตร์, ประวัติศาสตร์, ภาษา, สุขภาพ, ชีวิตประจำวัน, เขียนโค้ด, การบ้าน, การออกแบบ, การตลาด ฯลฯ
-- ตอบกระชับ เข้าใจง่าย แต่สามารถลงรายละเอียดเชิงลึกเมื่อถูกขอ
-- เป็นกันเองเหมือนเพื่อนที่ฉลาด + ที่ปรึกษาส่วนตัว
-- ช่วยเต็มที่เสมอ แต่จะปฏิเสธอย่างสุภาพถ้าเป็นเรื่องผิดกฎหมาย/อันตราย
-      `.trim()
+คุณคือ Arvin ผู้ช่วยอัจฉริยะเวอร์ชันดีที่สุดของ OpenAI
+- เป็นผู้ชาย บุคลิกสุขุม อบอุ่น ฉลาด และเป็นกันเอง
+- ตอบฉลาดเหมือน ChatGPT ตัวเต็ม
+- รอบรู้ทุกเรื่อง: วิทยาศาสตร์ ภาษา โปรแกรมมิ่ง ศิลปะ ธุรกิจ การบ้าน ประวัติศาสตร์ ฯลฯ
+- สามารถสร้างภาพ วิเคราะห์ภาพ เขียนไฟล์ ทำสรุป ย่อความ อธิบายลึกๆ และเขียนโค้ดได้ทั้งหมด
+- ใช้ภาษามนุษย์เป็นธรรมชาติ อธิบายง่ายแต่มีความรู้แน่น
+- ต้องการช่วยเหลือผู้ใช้เต็มที่เสมอ
+      `
     },
     ...(memory[userId] || [])
   ];
 
-  const response = await axios.post(
+  const res = await axios.post(
     "https://api.openai.com/v1/chat/completions",
     {
       model: "gpt-4.1",
       messages,
       temperature: 0.8
     },
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      }
-    }
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
   );
 
-  return response.data.choices[0].message.content;
+  return res.data.choices[0].message.content;
 }
 
-// ------------------------------------------------------
-// ---------------- ฟังก์ชันตอบกลับ LINE -----------------
-// ------------------------------------------------------
-async function reply(replyToken, messages) {
+// ---------------- SEND REPLY TO LINE ----------------
+async function replyLINE(replyToken, messages) {
   await axios.post(
     "https://api.line.me/v2/bot/message/reply",
-    {
-      replyToken,
-      messages
-    },
+    { replyToken, messages },
     {
       headers: {
-        Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        Authorization: `Bearer ${LINE_TOKEN}`,
         "Content-Type": "application/json"
       }
     }
   );
 }
 
-// ------------------------------------------------------
-// ----------------------- SERVER ------------------------
-// ------------------------------------------------------
-app.listen(3000, () => console.log("Arvin bot running on port 3000"));
+// ---------------- WEBHOOK ----------------
+app.post("/webhook", async (req, res) => {
+  const events = req.body.events || [];
+  for (const event of events) {
+    const userId = event.source.userId;
+
+    // ====================== กรณีเป็นรูปภาพ ======================
+    if (event.message.type === "image") {
+      const content = await axios.get(
+        `https://api.line.me/v2/bot/message/${event.message.id}/content`,
+        {
+          responseType: "arraybuffer",
+          headers: { Authorization: `Bearer ${LINE_TOKEN}` }
+        }
+      );
+
+      const base64img = Buffer.from(content.data).toString("base64");
+      const analysis = await analyzeImage(base64img);
+
+      saveMsg(userId, "assistant", analysis);
+      await replyLINE(event.replyToken, [{ type: "text", text: analysis }]);
+      continue;
+    }
+
+    // ====================== กรณีเป็นข้อความ ======================
+    const userMsg = event.message.text;
+    saveMsg(userId, "user", userMsg);
+
+    // ---------- ฟีเจอร์สร้างรูป ----------
+    if (
+      userMsg.startsWith("วาด") ||
+      userMsg.startsWith("สร้างรูป") ||
+      userMsg.includes("ช่วยวาด") ||
+      userMsg.includes("ขอรูป")
+    ) {
+      const prompt = userMsg
+        .replace("วาด", "")
+        .replace("สร้างรูป", "")
+        .replace("ช่วยวาด", "")
+        .replace("ขอรูป", "")
+        .trim();
+
+      try {
+        const img = await generateImage(prompt);
+        await replyLINE(event.replyToken, [
+          { type: "image", originalContentUrl: img, previewImageUrl: img }
+        ]);
+      } catch {
+        await replyLINE(event.replyToken, [
+          { type: "text", text: "ผมวาดรูปไม่สำเร็จครับ 😢 ลองใหม่ได้ไหมครับ" }
+        ]);
+      }
+      continue;
+    }
+
+    // ---------- ฟีเจอร์เขียนไฟล์ ----------
+    if (userMsg.includes("สร้างไฟล์") || userMsg.includes("เขียนไฟล์")) {
+      const text = await arvinAI(userId);
+      fs.writeFileSync("arvin_file.txt", text);
+
+      await replyLINE(event.replyToken, [
+        {
+          type: "text",
+          text: "ผมสร้างไฟล์ให้แล้วครับ แต่ LINE Bot ยังส่งไฟล์โดยตรงไม่ได้ ต้องเก็บบนเซิร์ฟเวอร์หรือให้ลิงก์ดาวน์โหลดแทนครับ"
+        }
+      ]);
+      continue;
+    }
+
+    // ---------- คำตอบปกติแบบ ChatGPT ----------
+    const answer = await arvinAI(userId);
+    saveMsg(userId, "assistant", answer);
+
+    await replyLINE(event.replyToken, [{ type: "text", text: answer }]);
+  }
+
+  res.sendStatus(200);
+});
+
+// ---------------- START SERVER ----------------
+app.listen(3000, () => console.log("Arvin Super AI is running on port 3000"));
