@@ -202,13 +202,13 @@ async function askArvin(userId) {
   return response.data.choices[0].message.content;
 }
 
-// --------- ฟังก์ชันสร้างรูปภาพ ----------
+// --------- ฟังก์ชันสร้างรูปภาพ (เวอร์ชันใหม่ของ OpenAI) ----------
 async function generateImage(prompt) {
   const res = await axios.post(
-    "https://api.openai.com/v1/images/generations",
+    "https://api.openai.com/v1/images",
     {
       model: "gpt-image-1",
-      prompt,
+      prompt: prompt,
       size: "1024x1024"
     },
     {
