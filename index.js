@@ -1,89 +1,80 @@
 import express from "express";
 import axios from "axios";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// ตรวจว่าเซิร์ฟเวอร์ทำงาน
+app.get("/", (req, res) => {
+  res.send("LINE OpenAI Bot is running!");
+});
 
-// ฟังก์ชันถาม OpenAI
-async function askOpenAI(userText) {
-  const response = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4.1-mini",
-      messages: [
-        {
-          role: "system",
-          content: "You are a helpful assistant that always replies in Thai."
-        },
-        {
-          role: "user",
-          content: userText
-        }
-      ]
-    },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`
-      }
-    }
-  );
-
-  const aiReply =
-    response.data.choices?.[0]?.message?.content?.trim() ||
-    "ขออภัยค่ะ ตอนนี้ระบบไม่สามารถตอบได้";
-
-  return aiReply;
-}
-
-// Webhook LINE
+// Webhook endpoint ต้องเป็น POST เท่านั้น
 app.post("/webhook", async (req, res) => {
-  const events = req.body.events || [];
+  const events = req.body.events;
 
-  res.status(200).send("OK"); // ตอบกลับทันที กัน timeout
+  // LINE ต้องการ HTTP 200 ทันที
+  res.sendStatus(200);
+
+  if (!events || events.length === 0) return;
 
   for (const event of events) {
-    try {
-      if (event.type !== "message" || event.message.type !== "text") {
-        continue;
-      }
-
+    if (event.type === "message" && event.message.type === "text") {
+      const userMessage = event.message.text;
       const replyToken = event.replyToken;
-      const userText = event.message.text;
 
-      const aiReply = await askOpenAI(userText);
+      // เรียก OpenAI
+      const aiResponse = await callOpenAI(userMessage);
 
-      await axios.post(
-        "https://api.line.me/v2/bot/message/reply",
-        {
-          replyToken,
-          messages: [
-            {
-              type: "text",
-              text: aiReply
-            }
-          ]
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
-          }
-        }
-      );
-    } catch (err) {
-      console.error("Error:", err.response?.data || err.message);
+      // ส่งข้อความตอบกลับ LINE
+      await replyToLine(replyToken, aiResponse);
     }
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Bot server running on port", PORT);
-});
+// ฟังก์ชันเรียก OpenAI
+async function callOpenAI(text) {
+  try {
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: text }],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    return response.data.choices[0].message.content;
+  } catch (err) {
+    console.error(err.response?.data || err);
+    return "ขอโทษครับ ระบบ AI เกิดข้อผิดพลาด 😢";
+  }
+}
+
+// ฟังก์ชันตอบกลับ LINE
+async function replyToLine(replyToken, text) {
+  try {
+    await axios.post(
+      "https://api.line.me/v2/bot/message/reply",
+      {
+        replyToken: replyToken,
+        messages: [{ type: "text", text: text }],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } catch (error) {
+    console.error("LINE reply error:", error.response?.data || error);
+  }
+}
+
+app.listen(3000, () => console.log("Server running on port 3000"));
