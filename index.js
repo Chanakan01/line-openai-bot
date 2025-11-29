@@ -270,8 +270,23 @@ async function generateImage(promptRaw) {
 
     fs.writeFileSync(filePath, buffer);
 
-    // URL ที่ LINE จะโหลดรูปได้
-    const imageUrl = `${PUBLIC_BASE_URL}/images/${filename}`;
+    // ---- ตรงนี้คือส่วนที่แก้ เพื่อให้ URL ที่ LINE ใช้โหลดรูปถูกต้อง ----
+    let baseUrl = (PUBLIC_BASE_URL || "").trim();
+
+    // ตัด / ท้ายออก (ถ้ามี) กันกลายเป็น //images
+    if (baseUrl.endsWith("/")) {
+      baseUrl = baseUrl.slice(0, -1);
+    }
+
+    // ถ้าเผลอใส่ http:// มา ให้บังคับเป็น https:// เพราะ LINE ต้องการ https
+    if (baseUrl.startsWith("http://")) {
+      baseUrl = "https://" + baseUrl.slice("http://".length);
+    }
+
+    const imageUrl = `${baseUrl}/images/${filename}`;
+    console.log("Generated image URL for LINE:", imageUrl); // เอาไว้ debug ดูใน console
+    // ---------------------------------------------------------
+
     return imageUrl;
   } catch (err) {
     console.error("Stability image gen error:", err.response?.data || err.message);
