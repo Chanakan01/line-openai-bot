@@ -1,81 +1,166 @@
 import express from "express";
 import axios from "axios";
-import fs from "fs";
 import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-// ---------------- CONFIG ----------------
+// ------------- CONFIG -------------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const TAVILY_KEY = process.env.TAVILY_KEY;
 
-// ---------------- MEMORY ----------------
-let memory = {}; 
-function saveMsg(userId, role, content) {
+// ------------- MEMORY (จำบทสนทนา 20 นาที) -------------
+let memory = {}; // { userId: [ {role, content}, ... ] }
+
+function saveMessage(userId, role, content) {
+  if (!userId || !content) return;
   if (!memory[userId]) memory[userId] = [];
   memory[userId].push({ role, content });
 
+  // จำกัดความยาวประวัติ
   if (memory[userId].length > 20) memory[userId].shift();
 
-  // ลบ memory หลัง 20 นาที
-  setTimeout(() => delete memory[userId], 20 * 60 * 1000);
+  // เคลียร์ทิ้งหลัง 20 นาที
+  setTimeout(() => {
+    delete memory[userId];
+  }, 20 * 60 * 1000);
 }
 
-// ---------------- IMAGE ANALYSIS ----------------
+// ------------- ตัวช่วยตรวจว่าควรค้นเว็บไหม -------------
+function needWebSearch(userMessage) {
+  if (!userMessage) return false;
+  const keywords = [
+    "ข่าว", "วันนี้", "ล่าสุด", "ปัจจุบัน", "update",
+    "เหตุการณ์", "สถานการณ์", "ราคา", "ดารา",
+    "เทคโนโลยี", "กีฬา", "ฟุตบอล", "หุ้น", "ทองคำ",
+    "วันนี้เป็นยังไง", "ตอนนี้เกิดอะไรขึ้น"
+  ];
+  const lower = userMessage.toLowerCase();
+  return keywords.some(
+    (kw) => userMessage.includes(kw) || lower.includes(kw)
+  );
+}
+
+// ------------- เรียก Tavily Web Search -------------
+async function searchWeb(query) {
+  if (!TAVILY_KEY) return null;
+
+  try {
+    const res = await axios.post(
+      "https://api.tavily.com/search",
+      {
+        api_key: TAVILY_KEY,
+        query,
+        max_results: 5,
+        search_depth: "basic"
+      },
+      {
+        headers: { "Content-Type": "application/json" }
+      }
+    );
+
+    return res.data.results; // array ของผลค้นหา
+  } catch (err) {
+    console.error("Tavily error:", err.response?.data || err.message);
+    return null;
+  }
+}
+
+// ------------- วิเคราะห์รูปภาพ (Image Analyzer) -------------
 async function analyzeImage(base64) {
-  const res = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4.1",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "ช่วยวิเคราะห์รูปนี้ให้ละเอียดที่สุด" },
-            {
-              type: "image_url",
-              image_url: `data:image/jpeg;base64,${base64}`
-            }
-          ]
+  try {
+    const res = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4.1",
+        messages: [
+          {
+            role: "system",
+            content: `
+คุณคือผู้ช่วยชื่อ Arvin ที่ช่วยอธิบายและวิเคราะห์รูปภาพให้เข้าใจง่าย
+- อธิบายว่ามีอะไรในภาพ
+- ถ้าเป็นเอกสาร/สลิป/ข้อความ ให้ช่วยอ่านข้อความและสรุป
+- ตอบเป็นภาษาไทยที่เข้าใจง่าย
+            `.trim()
+          },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "ช่วยวิเคราะห์และอธิบายรูปนี้ให้ละเอียดหน่อยครับ" },
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:image/jpeg;base64,${base64}`
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
         }
-      ]
-    },
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
-  );
+      }
+    );
 
-  return res.data.choices[0].message.content;
+    return res.data.choices[0].message.content;
+  } catch (err) {
+    console.error("Image analyze error:", err.response?.data || err.message);
+    return "ผมวิเคราะห์รูปนี้ไม่สำเร็จครับ ลองส่งใหม่อีกครั้งได้ไหมครับ 🙏";
+  }
 }
 
-// ---------------- IMAGE GENERATION ----------------
-async function generateImage(prompt) {
-  const res = await axios.post(
-    "https://api.openai.com/v1/images/generations",
-    {
-      model: "gpt-image-1",
-      prompt,
-      size: "1024x1024"
-    },
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
-  );
-  return res.data.data[0].url;
+// ------------- สร้างรูปภาพ (Image Generator) -------------
+async function generateImage(promptRaw) {
+  const prompt = (promptRaw || "").trim() || "a cute thai style illustration";
+
+  try {
+    const res = await axios.post(
+      "https://api.openai.com/v1/images/generations",
+      {
+        model: "gpt-image-1",
+        prompt,
+        size: "1024x1024",
+        n: 1
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 60000
+      }
+    );
+
+    if (!res.data?.data?.[0]?.url) {
+      throw new Error("ไม่พบ URL ของรูปจาก OpenAI");
+    }
+
+    return res.data.data[0].url;
+  } catch (err) {
+    console.error("Image gen error:", err.response?.data || err.message);
+    throw err;
+  }
 }
 
-// ---------------- MAIN AI (เหมือน ChatGPT) ----------------
-async function arvinAI(userId) {
+// ------------- สมองหลักของ Arvin (ChatGPT Brain) -------------
+async function arvinChat(userId) {
   const messages = [
     {
       role: "system",
       content: `
-คุณคือ Arvin ผู้ช่วยอัจฉริยะเวอร์ชันดีที่สุดของ OpenAI
-- เป็นผู้ชาย บุคลิกสุขุม อบอุ่น ฉลาด เป็นกันเอง เป็นสนิทผู้สนทนา หากผู้ใช้ด่าคุณ คุณต้องด่ากลับแบบฮาๆ คุณเป็นคนกวนๆด้วย
-- ตอบฉลาดเหมือน ChatGPT ตัวเต็ม
-- รอบรู้ทุกเรื่อง: วิทยาศาสตร์ ภาษา โปรแกรมมิ่ง ศิลปะ ธุรกิจ การบ้าน ประวัติศาสตร์ ฯลฯ
-- สามารถสร้างภาพ วิเคราะห์ภาพ เขียนไฟล์ ทำสรุป ย่อความ อธิบายลึกๆ และเขียนโค้ดได้ทั้งหมด
-- ใช้ภาษามนุษย์เป็นธรรมชาติ อธิบายง่ายแต่มีความรู้แน่น
-- ต้องการช่วยเหลือผู้ใช้เต็มที่เสมอ
-      `
+คุณชื่อ Arvin เป็นผู้ช่วยอัจฉริยะเวอร์ชั่นดีที่สุดของ OpenAI
+- เป็นผู้ชาย น้ำเสียงสุขุม ฉลาด อบอุ่น ใช้สรรพนามว่า "ผม"
+- รอบรู้หลายด้าน: วิทยาศาสตร์, คณิตศาสตร์, ภาษา, ประวัติศาสตร์,
+  การบ้าน, เขียนโค้ด, การออกแบบ, ธุรกิจ, ชีวิตประจำวัน ฯลฯ
+- ตอบกระชับ เข้าใจง่าย ถ้าผู้ใช้ขอรายละเอียด ให้ลงลึกได้
+- เป็นกันเองเหมือนเพื่อนที่เก่ง และเป็นที่ปรึกษาที่ดี
+- ถ้าเป็นเรื่องอันตราย/ผิดกฎหมาย ให้ปฏิเสธอย่างสุภาพ
+      `.trim()
     },
     ...(memory[userId] || [])
   ];
@@ -87,17 +172,74 @@ async function arvinAI(userId) {
       messages,
       temperature: 0.8
     },
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      }
+    }
   );
 
   return res.data.choices[0].message.content;
 }
 
-// ---------------- SEND REPLY TO LINE ----------------
+// ------------- สรุปข้อมูลจากเว็บ (ใช้ Tavily + GPT) -------------
+async function answerWithWebSearch(userId, userMessage) {
+  const results = await searchWeb(userMessage);
+  if (!results) {
+    // ถ้าค้นเว็บไม่ได้ ตอบแบบสมองปกติ
+    return arvinChat(userId);
+  }
+
+  const webText = JSON.stringify(results, null, 2);
+
+  const res = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4.1",
+      messages: [
+        {
+          role: "system",
+          content: `
+คุณคือ Arvin ผู้ช่วยที่สรุปข่าวและข้อมูลจากอินเทอร์เน็ต
+- ใช้ข้อมูลจากผลการค้นหาที่ได้รับเท่านั้น
+- สรุปเป็นภาษาไทย อ่านง่าย เหมาะกับผู้ใช้ทั่วไป
+- ถ้าข้อมูลไม่แน่ใจ ให้เตือนว่าข้อมูลอาจไม่ 100% ทันสมัย
+        `.trim()
+        },
+        {
+          role: "user",
+          content: `
+คำถามของผู้ใช้: ${userMessage}
+
+นี่คือผลการค้นหาจากเว็บ (JSON):
+${webText}
+
+ช่วยสรุปคำตอบที่ดีที่สุดให้หน่อยครับ
+        `.trim()
+        }
+      ],
+      temperature: 0.5
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  return res.data.choices[0].message.content;
+}
+
+// ------------- ส่งข้อความกลับ LINE (reply) -------------
 async function replyLINE(replyToken, messages) {
   await axios.post(
     "https://api.line.me/v2/bot/message/reply",
-    { replyToken, messages },
+    {
+      replyToken,
+      messages
+    },
     {
       headers: {
         Authorization: `Bearer ${LINE_TOKEN}`,
@@ -107,84 +249,156 @@ async function replyLINE(replyToken, messages) {
   );
 }
 
-// ---------------- WEBHOOK ----------------
-app.post("/webhook", async (req, res) => {
-  const events = req.body.events || [];
-  for (const event of events) {
-    const userId = event.source.userId;
-
-    // ====================== กรณีเป็นรูปภาพ ======================
-    if (event.message.type === "image") {
-      const content = await axios.get(
-        `https://api.line.me/v2/bot/message/${event.message.id}/content`,
-        {
-          responseType: "arraybuffer",
-          headers: { Authorization: `Bearer ${LINE_TOKEN}` }
-        }
-      );
-
-      const base64img = Buffer.from(content.data).toString("base64");
-      const analysis = await analyzeImage(base64img);
-
-      saveMsg(userId, "assistant", analysis);
-      await replyLINE(event.replyToken, [{ type: "text", text: analysis }]);
-      continue;
-    }
-
-    // ====================== กรณีเป็นข้อความ ======================
-    const userMsg = event.message.text;
-    saveMsg(userId, "user", userMsg);
-
-    // ---------- ฟีเจอร์สร้างรูป ----------
-    if (
-      userMsg.startsWith("วาด") ||
-      userMsg.startsWith("สร้างรูป") ||
-      userMsg.includes("ช่วยวาด") ||
-      userMsg.includes("ขอรูป")
-    ) {
-      const prompt = userMsg
-        .replace("วาด", "")
-        .replace("สร้างรูป", "")
-        .replace("ช่วยวาด", "")
-        .replace("ขอรูป", "")
-        .trim();
-
-      try {
-        const img = await generateImage(prompt);
-        await replyLINE(event.replyToken, [
-          { type: "image", originalContentUrl: img, previewImageUrl: img }
-        ]);
-      } catch {
-        await replyLINE(event.replyToken, [
-          { type: "text", text: "ขณะนี้ระบบสร้างรูปภาพปิดปรับปรุงชั่วคราวครับ" }
-        ]);
+// ------------- Broadcast แจ้งเตือนทุกคน -------------
+async function broadcast(message) {
+  await axios.post(
+    "https://api.line.me/v2/bot/message/broadcast",
+    {
+      messages: [{ type: "text", text: message }]
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${LINE_TOKEN}`,
+        "Content-Type": "application/json"
       }
-      continue;
     }
+  );
+}
 
-    // ---------- ฟีเจอร์เขียนไฟล์ ----------
-    if (userMsg.includes("สร้างไฟล์") || userMsg.includes("เขียนไฟล์")) {
-      const text = await arvinAI(userId);
-      fs.writeFileSync("arvin_file.txt", text);
-
-      await replyLINE(event.replyToken, [
-        {
-          type: "text",
-          text: "ผมสร้างไฟล์ให้แล้วครับ แต่ LINE Bot ยังส่งไฟล์โดยตรงไม่ได้ ต้องเก็บบนเซิร์ฟเวอร์หรือให้ลิงก์ดาวน์โหลดแทนครับ"
-        }
-      ]);
-      continue;
-    }
-
-    // ---------- คำตอบปกติแบบ ChatGPT ----------
-    const answer = await arvinAI(userId);
-    saveMsg(userId, "assistant", answer);
-
-    await replyLINE(event.replyToken, [{ type: "text", text: answer }]);
-  }
-
-  res.sendStatus(200);
+// ------------- Health check -------------
+app.get("/", (req, res) => {
+  res.send("Arvin Super AI is running 🚀");
 });
 
-// ---------------- START SERVER ----------------
-app.listen(3000, () => console.log("Arvin Super AI is running on port 3000"));
+// ------------- Endpoint แจ้งอัปเดตระบบ -------------
+// เรียกแบบ: GET /announce-update
+// หรือ:     GET /announce-update?msg=ข้อความของคุณ
+app.get("/announce-update", async (req, res) => {
+  const msg =
+    req.query.msg ||
+    "📢 Arvin อัปเดตระบบเรียบร้อยแล้วครับ! ตอนนี้ผมฉลาดขึ้นและมีฟีเจอร์ใหม่ให้ลองใช้งานแล้วนะครับ 🎉";
+
+  try {
+    await broadcast(msg);
+    res.send("ส่งประกาศอัปเดตให้ผู้ใช้งานเรียบร้อยแล้วครับ ✅");
+  } catch (err) {
+    console.error("Broadcast error:", err.response?.data || err.message);
+    res.status(500).send("ส่งประกาศไม่สำเร็จ: " + err.message);
+  }
+});
+
+// ------------- LINE Webhook -------------
+app.post("/webhook", async (req, res) => {
+  const events = req.body.events || [];
+  // ตอบ 200 ให้ LINE ก่อน กัน timeout
+  res.sendStatus(200);
+
+  for (const event of events) {
+    try {
+      if (event.type !== "message") continue;
+      const userId = event.source?.userId || "unknown";
+
+      // ===== กรณีเป็นรูปภาพ (ให้วิเคราะห์ภาพ) =====
+      if (event.message.type === "image") {
+        try {
+          const contentRes = await axios.get(
+            `https://api-data.line.me/v2/bot/message/${event.message.id}/content`,
+            {
+              responseType: "arraybuffer",
+              headers: { Authorization: `Bearer ${LINE_TOKEN}` }
+            }
+          );
+
+          const base64 = Buffer.from(contentRes.data, "binary").toString("base64");
+          const analysis = await analyzeImage(base64);
+          saveMessage(userId, "assistant", analysis);
+
+          await replyLINE(event.replyToken, [
+            { type: "text", text: analysis }
+          ]);
+        } catch (err) {
+          console.error("Handle image error:", err.response?.data || err.message);
+          await replyLINE(event.replyToken, [
+            {
+              type: "text",
+              text: "ผมอ่านรูปนี้ไม่สำเร็จครับ ลองส่งใหม่อีกครั้งได้ไหมครับ 🙏"
+            }
+          ]);
+        }
+        continue;
+      }
+
+      // ===== กรณีเป็นข้อความ =====
+      if (event.message.type !== "text") continue;
+      const userMessage = (event.message.text || "").trim();
+      if (!userMessage) continue;
+
+      saveMessage(userId, "user", userMessage);
+
+      // ตรวจว่าเป็นคำขอวาดรูปไหม (ไม่ต้องพิมพ์ /img)
+      const lower = userMessage.toLowerCase();
+      const wantImage =
+        userMessage.startsWith("วาด") ||
+        userMessage.startsWith("สร้างรูป") ||
+        userMessage.includes("ช่วยวาด") ||
+        userMessage.includes("ขอรูป") ||
+        lower.includes("logo") ||
+        lower.includes("โลโก้") ||
+        lower.includes("โปสเตอร์") ||
+        lower.includes("banner");
+
+      if (wantImage) {
+        const prompt = userMessage
+          .replace(/^วาด\s*/g, "")
+          .replace(/^สร้างรูป\s*/g, "")
+          .replace("ช่วยวาด", "")
+          .replace("ขอรูป", "")
+          .trim();
+
+        try {
+          const imageUrl = await generateImage(prompt);
+          await replyLINE(event.replyToken, [
+            {
+              type: "image",
+              originalContentUrl: imageUrl,
+              previewImageUrl: imageUrl
+            }
+          ]);
+        } catch (err) {
+          await replyLINE(event.replyToken, [
+            {
+              type: "text",
+              text:
+                "ผมสร้างรูปไม่สำเร็จครับ อาจมีปัญหาที่ระบบสร้างภาพ ลองพิมพ์ใหม่อีกครั้งภายหลังนะครับ 😢"
+            }
+          ]);
+        }
+        continue;
+      }
+
+      // ตรวจว่าควรใช้ Web Search ไหม
+      if (needWebSearch(userMessage)) {
+        const answer = await answerWithWebSearch(userId, userMessage);
+        saveMessage(userId, "assistant", answer);
+        await replyLINE(event.replyToken, [{ type: "text", text: answer }]);
+        continue;
+      }
+
+      // ปกติ: ใช้สมองหลักของ Arvin (ChatGPT Brain)
+      const answer = await arvinChat(userId);
+      saveMessage(userId, "assistant", answer);
+
+      await replyLINE(event.replyToken, [
+        { type: "text", text: answer }
+      ]);
+    } catch (err) {
+      console.error("Event error:", err.response?.data || err.message);
+    }
+  }
+});
+
+// ------------- START SERVER -------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Arvin Super AI is running on port ${PORT}`);
+});
