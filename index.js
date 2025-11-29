@@ -1,3 +1,4 @@
+
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
@@ -28,18 +29,6 @@ const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const TAVILY_KEY = process.env.TAVILY_KEY;
 const STABILITY_API_KEY = process.env.STABILITY_API_KEY;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
-
-// ------------- PACKAGE / LIMIT CONFIG -------------
-// จำกัดแพ็กเกจ Free ให้ใช้ได้รวม 30 ครั้ง / วัน (คุย + วาดรูป + วิเคราะห์รูป + ค้นเว็บ นับรวม)
-// ปรับตัวเลขได้ตามใจ
-const FREE_DAILY_LIMIT = 30;
-
-const PLAN_FREE_TEXT = "ใช้แพ็กเกจ Free 0฿";
-const PLAN_PREMIUM_TEXT = "สมัคร Premium 99฿";
-
-// เก็บข้อมูลแพ็กเกจและการใช้งานต่อวัน
-// โครงสร้าง: { userId: { plan: "FREE" | "PREMIUM", usageDate: "YYYY-MM-DD", usageCount: number } }
-let userPlans = {};
 
 // ------------- MEMORY (จำบทสนทนา 20 นาที) -------------
 // โครงสร้าง: { userId: [ { role: "user" | "assistant" | "system", content: string }, ... ] }
@@ -72,80 +61,6 @@ function getConversationMessages(userId) {
     role: m.role,
     content: m.content,
   }));
-}
-
-// ------------- helper: วันที่วันนี้เป็น string -------------
-function getTodayStr() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-}
-
-// ------------- helper: ปุ่มเลือกแพ็กเกจ -------------
-function buildPlanQuickReply() {
-  return {
-    items: [
-      {
-        type: "action",
-        action: {
-          type: "message",
-          label: "Free 0฿ (จำกัด/วัน)",
-          text: PLAN_FREE_TEXT
-        }
-      },
-      {
-        type: "action",
-        action: {
-          type: "message",
-          label: "Premium 99฿ (ไม่จำกัด)",
-          text: PLAN_PREMIUM_TEXT
-        }
-      }
-    ]
-  };
-}
-
-// ------------- helper: จัดการแพ็กเกจ & ลิมิต -------------
-
-function ensureUserPlan(userId) {
-  if (!userPlans[userId]) {
-    userPlans[userId] = {
-      plan: null,
-      usageDate: getTodayStr(),
-      usageCount: 0
-    };
-  }
-}
-
-function setUserPlan(userId, plan) {
-  ensureUserPlan(userId);
-  userPlans[userId].plan = plan; // "FREE" หรือ "PREMIUM"
-  userPlans[userId].usageDate = getTodayStr();
-  userPlans[userId].usageCount = 0;
-}
-
-function checkAndConsumeUsage(userId) {
-  const data = userPlans[userId];
-  if (!data || !data.plan) {
-    return { allowed: false, reason: "NOPLAN" };
-  }
-
-  // Premium ไม่จำกัด
-  if (data.plan === "PREMIUM") {
-    return { allowed: true };
-  }
-
-  // Free → เช็กวัน / นับครั้ง
-  const today = getTodayStr();
-  if (data.usageDate !== today) {
-    data.usageDate = today;
-    data.usageCount = 0;
-  }
-
-  if (data.usageCount >= FREE_DAILY_LIMIT) {
-    return { allowed: false, reason: "LIMIT" };
-  }
-
-  data.usageCount++;
-  return { allowed: true };
 }
 
 // ------------- ตัวช่วยตรวจว่าควรค้นเว็บไหม (จาก keyword แบบเดิม) -------------
@@ -306,7 +221,6 @@ async function analyzeImage(base64) {
     return "ผมวิเคราะห์รูปนี้ไม่สำเร็จครับ ลองส่งใหม่อีกครั้งได้ไหมครับ 🙏";
   }
 }
-
 // ------------- แปลงคำขอวาดรูปให้เป็น prompt ภาษาอังกฤษ -------------
 async function buildImagePrompt(promptRaw) {
   const original = (promptRaw || "").trim();
@@ -361,7 +275,6 @@ async function buildImagePrompt(promptRaw) {
     return original;
   }
 }
-
 // ------------- สร้างรูปภาพด้วย Stability AI -------------
 async function generateImage(promptRaw) {
   // ใช้ GPT ช่วยแปลง prompt ไทย → อังกฤษก่อน
@@ -435,7 +348,6 @@ async function generateImage(promptRaw) {
     throw err;
   }
 }
-
 // ------------- Quick Reply ปุ่มลัด -------------
 // ปุ่ม: 🧠 ถามการบ้าน / 🎨 ขอให้วาดรูป / 📰 สรุปข่าววันนี้
 function buildDefaultQuickReply() {
@@ -635,81 +547,6 @@ app.post("/webhook", async (req, res) => {
     try {
       if (event.type !== "message") continue;
       const userId = event.source?.userId || "unknown";
-
-      // ===== ถ้ายังไม่ได้เลือกแพ็กเกจ / หรือกำลังเลือกแพ็กเกจ =====
-      if (event.message.type === "text") {
-        const rawText = (event.message.text || "").trim();
-
-        // ผู้ใช้กดเลือก Free
-        if (rawText === PLAN_FREE_TEXT) {
-          setUserPlan(userId, "FREE");
-          await replyLINE(event.replyToken, [
-            {
-              type: "text",
-              text: `คุณเลือกใช้แพ็กเกจ Free 0฿ แล้วนะครับ ✅\nวันนี้คุณสามารถใช้งานได้ ${FREE_DAILY_LIMIT} ครั้ง ก่อนจะต้องรอวันถัดไป 😊`,
-              quickReply: buildDefaultQuickReply()
-            }
-          ]);
-          continue;
-        }
-
-        // ผู้ใช้กดเลือก Premium
-        if (rawText === PLAN_PREMIUM_TEXT) {
-          setUserPlan(userId, "PREMIUM");
-          await replyLINE(event.replyToken, [
-            {
-              type: "text",
-              text:
-                "คุณเลือกแพ็กเกจ Premium 99฿ แล้วนะครับ ✅\nใช้งานได้ไม่จำกัดเลย 🎉\n\nสำหรับการชำระเงิน กรุณาคลิกลิงก์นี้เพื่อชำระเงิน:\nhttps://example.com/pay-arvin-premium\n(เปลี่ยนลิงก์เป็นหน้าชำระเงินจริงของคุณเองได้เลยครับ)",
-              quickReply: buildDefaultQuickReply()
-            }
-          ]);
-          continue;
-        }
-      }
-
-      // ถ้ายังไม่มีข้อมูลแพ็กเกจเลย → ให้เลือกก่อนใช้งาน
-      if (!userPlans[userId] || !userPlans[userId].plan) {
-        await replyLINE(event.replyToken, [
-          {
-            type: "text",
-            text:
-              "สวัสดีครับ ผม Arvin 🧠\nก่อนเริ่มใช้งาน เลือกแพ็กเกจที่ต้องการก่อนนะครับ 👇",
-            quickReply: buildPlanQuickReply()
-          }
-        ]);
-        continue;
-      }
-
-      // ===== เช็กลิมิตการใช้งาน (Free / Premium) =====
-      const usageStatus = checkAndConsumeUsage(userId);
-      if (!usageStatus.allowed) {
-        if (usageStatus.reason === "LIMIT") {
-          // ใช้ครบแล้วในวันนี้
-          await replyLINE(event.replyToken, [
-            {
-              type: "text",
-              text:
-                `วันนี้คุณใช้แพ็กเกจ Free ครบ ${FREE_DAILY_LIMIT} ครั้งแล้วครับ 😢\n\nคุณสามารถรอใช้ใหม่วันพรุ่งนี้ หรืออัปเกรดเป็น Premium 99฿ เพื่อใช้งานได้ไม่จำกัดทันที`,
-              quickReply: buildPlanQuickReply()
-            }
-          ]);
-          continue;
-        }
-
-        // เผื่อกรณีแปลก ๆ
-        await replyLINE(event.replyToken, [
-          {
-            type: "text",
-            text:
-              "ไม่พบข้อมูลแพ็กเกจของคุณครับ ลองเลือกแพ็กเกจใหม่อีกครั้งนะครับ 👇",
-            quickReply: buildPlanQuickReply()
-          }
-        ]);
-        continue;
-      }
-
-      // ===== จากนี้คือระบบเดิมของคุณ (หลังผ่านเรื่องแพ็กเกจและลิมิตแล้ว) =====
 
       // ===== กรณีเป็นรูปภาพ (ให้วิเคราะห์ภาพ) =====
       if (event.message.type === "image") {
