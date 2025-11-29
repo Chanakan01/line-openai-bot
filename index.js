@@ -382,7 +382,79 @@ function buildDefaultQuickReply() {
     ]
   };
 }
+// ------------- Hugging Face Image Generation (เพิ่มใหม่) -------------
+const HF_MODEL_URL =
+  "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0";
+const HF_TOKEN = process.env.HF_TOKEN;
 
+/**
+ * สร้างรูปด้วย Hugging Face จากข้อความภาษาไทย/อังกฤษ
+ * - ใช้ buildImagePrompt ที่มีอยู่แล้ว แปลงไทย → อังกฤษให้ก่อน
+ * - เซฟไฟล์ลงโฟลเดอร์ generated (ใช้ GENERATED_DIR เดิม)
+ * - คืนค่าเป็น path สำหรับเสิร์ฟผ่าน /images/...
+ */
+async function generateImageWithHuggingFace(promptRaw) {
+  if (!HF_TOKEN) {
+    throw new Error("ยังไม่ได้ตั้งค่า HF_TOKEN ใน Environment Variables");
+  }
+
+  // ใช้ตัวช่วยเดิม แปลง prompt ไทย → อังกฤษ
+  const prompt = await buildImagePrompt(promptRaw || "");
+
+  const response = await axios.post(
+    HF_MODEL_URL,
+    { inputs: prompt },
+    {
+      headers: {
+        Authorization: `Bearer ${HF_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      responseType: "arraybuffer", // รับเป็น binary รูปภาพ
+      timeout: 60000
+    }
+  );
+
+  // เซฟเป็นไฟล์ในโฟลเดอร์ generated
+  const filename = `hf_${Date.now()}_${Math.random()
+    .toString(36)
+    .slice(2)}.png`;
+  const filePath = path.join(GENERATED_DIR, filename);
+
+  fs.writeFileSync(filePath, response.data);
+
+  // คืน path สำหรับเสิร์ฟผ่าน /images
+  return `/images/${filename}`;
+}
+
+/**
+ * HTTP endpoint สำหรับเรียกจากข้างนอก (เช่น ทดสอบใน Postman / Frontend / LINE อื่น ๆ)
+ * POST /hf-generate
+ * body: { "prompt": "ข้อความบรรยายรูป" }
+ */
+app.post("/hf-generate", async (req, res) => {
+  try {
+    const promptRaw = req.body.prompt || "";
+
+    const imagePath = await generateImageWithHuggingFace(promptRaw);
+
+    // สร้าง URL เต็ม (ใช้ domain จริงจาก Render)
+    const fullUrl = `${req.protocol}://${req.get("host")}${imagePath}`;
+
+    res.json({
+      status: "success",
+      prompt: promptRaw,
+      image_path: imagePath,
+      image_url: fullUrl
+    });
+  } catch (err) {
+    console.error("Hugging Face gen error:", err.response?.data || err.message);
+    res.status(500).json({
+      status: "error",
+      message: "สร้างรูปจาก Hugging Face ไม่สำเร็จ",
+      detail: err.message
+    });
+  }
+});
 // ------------- สมองหลักของ Arvin (ChatGPT Brain) -------------
 async function arvinChat(userId) {
   const messages = [
